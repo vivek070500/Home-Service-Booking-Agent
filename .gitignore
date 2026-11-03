@@ -1,0 +1,21 @@
+# Runtime data
+data/traces/
+data/memory.json
+eval_results.json
+bugs.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Environment
+.env
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
