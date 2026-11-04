@@ -1,0 +1,75 @@
+BUGS FOUND & FIXED
+===================
+
+Bug #1: Slots never freed after cancel or reschedule
+-----------------------------------------------------
+Problem:
+  If someone cancelled a booking, the time slot stayed "used up" forever.
+  Nobody else could ever book that slot again. Same thing happened with
+  rescheduling — it ate up two slots instead of freeing the old one.
+
+Fix:
+  Added helper functions to give slots back when a booking is cancelled,
+  rescheduled, or a hold expires. Now slots are properly recycled.
+
+Status: FIXED
+
+
+Bug #2: Price could change without telling the user
+----------------------------------------------------
+Problem:
+  Sometimes the price changes between searching and actually holding a slot.
+  The agent could show the old (lower) price to the user, get their "yes",
+  and then book at the higher price. User pays more than they agreed to.
+
+Fix:
+  Added a price check in the code. When the agent proposes a booking, the
+  price shown to the user MUST match the actual held price. If it doesn't
+  match, the proposal is rejected and the agent has to show the correct price.
+
+Status: FIXED
+
+
+Bug #3: Small AI models skip steps or make up tool names
+---------------------------------------------------------
+Problem:
+  Smaller AI models (8B parameters) would sometimes:
+  - Misspell tool names (like "search_propliers" instead of "search_providers")
+  - Dump raw code instead of calling tools properly
+  - Try to book directly without going through the required steps
+
+Fix:
+  Switched to a graph-based design where the AI never has access to booking,
+  cancelling, or rescheduling tools directly. Those actions are handled by
+  the code after the user confirms. The AI can only search and propose —
+  it can't skip steps even if it tries to.
+
+Status: FIXED
+
+
+Bug #4: AI making up providers that don't exist
+------------------------------------------------
+Problem:
+  When no real provider matched the user's budget, the AI invented fake
+  providers with made-up names and prices instead of saying "sorry, nothing
+  in your budget."
+
+Fix:
+  Added a check: if the AI mentions providers without having searched first,
+  the code forces a real search. If the AI mentions a provider not found in
+  actual search results, it gets flagged and corrected.
+
+Status: FIXED
+
+
+Known Limitation: No instant notifications
+-------------------------------------------
+Problem:
+  If a provider cancels a booking, the user only finds out next time they
+  message the agent. There's no way to send an alert right away.
+
+Why it's okay for now:
+  This is a local demo — no real notification system (email, SMS, etc.)
+  exists. In a real product, this would use push notifications.
+
+Status: ACCEPTED (out of scope for demo)
