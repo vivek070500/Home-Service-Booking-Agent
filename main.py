@@ -28,12 +28,23 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Random seed for mock tools")
     parser.add_argument("--user", default="user-1", help="User ID for memory")
     parser.add_argument("--no-memory", action="store_true", help="Disable persistent memory")
+    parser.add_argument("--demo-timeout", action="store_true",
+                        help="Demo mode: booking always times out but actually succeeds")
+    parser.add_argument("--demo-slot-taken", action="store_true",
+                        help="Demo mode: booking always fails with slot taken")
     args = parser.parse_args()
 
     api_key = os.getenv("GROQ_API_KEY", "ollama")
 
     # Set up components
-    tool_server = ToolServer(config=MockConfig(seed=args.seed))
+    if args.demo_timeout:
+        cfg = MockConfig(seed=args.seed, book_success_rate=0.0,
+                         book_slot_taken_rate=0.0, timeout_actually_booked_rate=1.0)
+    elif args.demo_slot_taken:
+        cfg = MockConfig(seed=args.seed, book_success_rate=0.0, book_slot_taken_rate=1.0)
+    else:
+        cfg = MockConfig(seed=args.seed)
+    tool_server = ToolServer(config=cfg)
     memory = None if args.no_memory else MemoryStore(path="data/memory.json")
     tracer = Tracer()
 
@@ -48,9 +59,11 @@ def main():
     print("┌──────────────────────────────────────────────┐")
     print("│  🏠  Home-Service Booking Agent               │")
     print("│  Type your request, or 'quit' to exit.       │")
-    print("│  /cancel <booking_id> to simulate a provider │")
-    print("│    cancelling a booking (for testing).        │")
     print("└──────────────────────────────────────────────┘")
+    if args.demo_timeout:
+        print("  ⚡ Demo mode: bookings will timeout (but succeed on server)")
+    elif args.demo_slot_taken:
+        print("  ⚡ Demo mode: bookings will fail with slot taken")
 
     if memory:
         prefs = memory.list_all(args.user)
