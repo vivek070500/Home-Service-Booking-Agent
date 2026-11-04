@@ -122,6 +122,7 @@ class GraphAgent:
         self._phase = "chatting"
         self._proposal: Optional[Dict] = None
         self._hold: Optional[Dict] = None
+        self._last_booking: Optional[Dict] = None  # track last successful booking
         self._idem_keys: Dict[str, str] = {}
         self._known_providers: set = set()  # provider names returned by tools
 
@@ -146,6 +147,8 @@ class GraphAgent:
             date_range: str = "",
         ) -> str:
             """Search for home-service providers. service must be one of: plumbing, electrical, ac_service, cleaning, carpentry, painting."""
+            area = area or ""
+            date_range = date_range or ""
             result = ts.search_providers(
                 service=service,
                 area=area or None,
@@ -176,7 +179,7 @@ class GraphAgent:
             return json.dumps(result, ensure_ascii=False)
 
         @lc_tool
-        def propose_action(action: str, summary: str, hold_id: str = "", booking_id: str = "", new_slot: str = "") -> str:
+        def propose_action(action: str, summary: str = "", hold_id: str = "", booking_id: str = "", new_slot: str = "") -> str:
             """Propose a consequential action (book/cancel/reschedule) for user approval. After calling this, STOP and wait for user confirmation."""
             details = {}
 
@@ -333,34 +336,73 @@ class GraphAgent:
     def _validate_response(self, text: str) -> str:
         """
         Check LLM response for hallucinated providers.
-        If found, silently regenerate with a correction.
+        Two checks:
+        1. Model mentions providers without ever calling search_providers → force a search
+        2. Model mentions providers not in _known_providers → silently correct
         """
-        if not self._known_providers or not text:
+        if not text:
             return text
 
-        provider_mentions = re.findall(
-            r'(\b[A-Z][a-z]+(?:\s+[A-Z&][a-z]*)*'
-            r'(?:\s+(?:Plumbing|Electrical|Services|Cleaning|AC|Carpentry|Painting))+)\b',
-            text,
+        # Check 1: model talks about providers/prices but never searched
+        provider_keywords = re.findall(
+            r'(?:₹\d+|rating|★|plumb|electric|clean|paint|carpentr|ac.servic)',
+            text.lower(),
         )
-
-        hallucinated = [n for n in provider_mentions if n.lower() not in self._known_providers]
-
-        if hallucinated:
-            self.tracer.record("hallucination_detected", providers=hallucinated)
-            # Silently re-ask the LLM with a correction
+        if provider_keywords and not self._known_providers:
+            self.tracer.record("hallucination_no_search", keywords=provider_keywords)
             self.messages.append(SystemMessage(
                 content=(
-                    f"CORRECTION: You mentioned providers that do not exist: "
-                    f"{', '.join(hallucinated)}. "
-                    f"Only use providers from search results. "
-                    f"If no provider matches the budget, say so honestly. "
-                    f"Regenerate your response using ONLY real data."
+                    "CORRECTION: You described providers without calling search_providers first. "
+                    "You MUST call search_providers before presenting any provider info. "
+                    "Call search_providers now with the user's requirements."
                 )
             ))
-            corrected = self.llm.invoke(self.messages)
-            self.messages.append(corrected)
-            return corrected.content or text
+            try:
+                corrected = self._llm_with_tools.invoke(self.messages)
+                self.messages.append(corrected)
+                if corrected.tool_calls:
+                    for tc in corrected.tool_calls:
+                        tool_fn = next((t for t in self._safe_tools if t.name == tc["name"]), None)
+                        if tool_fn:
+                            # Sanitize args: replace None with "" for string params
+                            clean_args = {k: (v if v is not None else "") for k, v in tc["args"].items()}
+                            try:
+                                result = tool_fn.invoke(clean_args)
+                            except Exception:
+                                result = json.dumps({"error": "tool_call_failed"})
+                            self.messages.append(ToolMessage(
+                                content=result if isinstance(result, str) else json.dumps(result),
+                                tool_call_id=tc["id"],
+                            ))
+                    final = self.llm.invoke(self.messages)
+                    self.messages.append(final)
+                    return final.content or text
+                return corrected.content or text
+            except Exception:
+                return text
+
+        # Check 2: model mentions providers not in known set
+        if self._known_providers:
+            provider_mentions = re.findall(
+                r'(\b[A-Z][a-z]+(?:\s+[A-Z&][a-z]*)*'
+                r'(?:\s+(?:Plumbing|Electrical|Services|Cleaning|AC|Carpentry|Painting))+)\b',
+                text,
+            )
+            hallucinated = [n for n in provider_mentions if n.lower() not in self._known_providers]
+            if hallucinated:
+                self.tracer.record("hallucination_detected", providers=hallucinated)
+                self.messages.append(SystemMessage(
+                    content=(
+                        f"CORRECTION: You mentioned providers that do not exist: "
+                        f"{', '.join(hallucinated)}. "
+                        f"Only use providers from search results. "
+                        f"If no provider matches the budget, say so honestly. "
+                        f"Regenerate your response using ONLY real data."
+                    )
+                ))
+                corrected = self.llm.invoke(self.messages)
+                self.messages.append(corrected)
+                return corrected.content or text
 
         return text
 
@@ -429,6 +471,9 @@ class GraphAgent:
         self._inject_pending_events()
 
         # Step 1: if awaiting approval, check confirmation
+        self.tracer.record("phase_check", phase=self._phase,
+                           has_proposal=self._proposal is not None,
+                           has_hold=self._hold is not None)
         if self._phase == "awaiting_approval" and self._proposal:
             if _is_confirmation(user_message):
                 self.tracer.user_message(user_message)
@@ -447,6 +492,15 @@ class GraphAgent:
                     text = f"✅ Your {action_word} has been confirmed!"
                     if result.get("booking_id"):
                         text += f"\n📋 Booking ID: {result['booking_id']}"
+                    if action == "book" and result.get("booking_id"):
+                        self._last_booking = {
+                            "booking_id": result["booking_id"],
+                            "provider_id": details.get("provider_id", ""),
+                            "slot": details.get("slot", ""),
+                            "price": details.get("price", ""),
+                        }
+                    elif action == "cancel":
+                        self._last_booking = None
                     if action == "book":
                         provider = details.get("provider_id", "").replace("_", " ").title()
                         slot = details.get("slot", "")
@@ -457,9 +511,18 @@ class GraphAgent:
                             text += f" — ₹{price}"
                     text += "\n\nIs there anything else I can help you with?"
                 elif result.get("error") == "timeout":
-                    text = f"⏳ The {action_word} request timed out. Let me check the status..."
-                    if result.get("booking_check", {}).get("status") == "confirmed":
-                        text = f"✅ Your {action_word} went through despite the timeout!\n📋 Booking ID: {result['booking_check'].get('booking_id', 'N/A')}"
+                    check = result.get("booking_check", {})
+                    booking = check.get("booking", {})
+                    actually_booked = (check.get("status") == "found"
+                                       and booking.get("booking_status") == "confirmed")
+                    if actually_booked:
+                        text = (f"⏳ The booking request timed out, but after checking — "
+                                f"it actually went through!\n"
+                                f"✅ Your {action_word} is confirmed.\n"
+                                f"📋 Booking ID: {booking.get('booking_id', 'N/A')}")
+                    else:
+                        text = (f"⏳ The {action_word} request timed out and the booking "
+                                f"was not created. Would you like me to try again?")
                 elif result.get("error"):
                     error_type = result.get("error", "")
                     text = f"⚠️ There was an issue with your {action_word}: {result.get('message', error_type)}"
@@ -528,7 +591,7 @@ class GraphAgent:
                         self.tracer.tool_call(tool_name, tool_args, {"status": "ok"}, 0)
                         continue  # let LLM respond to tool result
 
-                # Auto-detect: if model has a hold and asks user to confirm
+                # Auto-detect booking proposal: model has a hold and asks user to confirm
                 if (self._hold and not self._proposal
                         and self._phase == "chatting"
                         and any(w in text.lower() for w in ["confirm", "yes", "proceed", "go ahead", "book"])):
@@ -541,6 +604,17 @@ class GraphAgent:
                             "slot": self._hold.get("slot", ""),
                         },
                         "summary": "Auto-detected proposal from hold",
+                    }
+                    self._phase = "awaiting_approval"
+
+                # Auto-detect cancel proposal: model says it will cancel and there's a recent booking
+                if (self._last_booking and not self._proposal
+                        and self._phase == "chatting"
+                        and any(w in text.lower() for w in ["cancel", "cancellation", "proceed with the cancel"])):
+                    self._proposal = {
+                        "action": "cancel",
+                        "details": {"booking_id": self._last_booking["booking_id"]},
+                        "summary": f"Cancel booking {self._last_booking['booking_id']}",
                     }
                     self._phase = "awaiting_approval"
                 text = self._validate_response(text)
@@ -557,7 +631,12 @@ class GraphAgent:
                 if tool_fn is None:
                     tool_result = json.dumps({"error": "unknown_tool", "message": f"No tool named '{tool_name}'. Check spelling."})
                 else:
-                    tool_result = tool_fn.invoke(tool_args)
+                    # Sanitize: replace None with "" for string params (LLM sometimes sends null)
+                    clean_args = {k: (v if v is not None else "") for k, v in tool_args.items()}
+                    try:
+                        tool_result = tool_fn.invoke(clean_args)
+                    except Exception as e:
+                        tool_result = json.dumps({"error": "tool_call_failed", "message": str(e)})
 
                 self.messages.append(ToolMessage(
                     content=tool_result if isinstance(tool_result, str) else json.dumps(tool_result),
