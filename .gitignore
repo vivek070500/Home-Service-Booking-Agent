@@ -2,7 +2,7 @@
 data/traces/
 data/memory.json
 eval_results.json
-bugs.txt
+g
 
 # Python
 __pycache__/
